@@ -1,0 +1,3 @@
+[[tls.certificates]]
+  certFile = "/etc/ssl/secretsanta/application.pem"
+  keyFile = "/etc/ssl/secretsanta/application-key.pem"

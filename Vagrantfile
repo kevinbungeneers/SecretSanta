@@ -16,18 +16,18 @@ end
 
 @docker_network = 'vagrant_nw'
 @hostname = 'dev.secretsantaorganizer.com'
-@provisioning_dir = '/vagrant/provisioning/docker'
+@aliases = [
+   "mails.#{@hostname}",
+   "phpmyadmin.#{@hostname}",
+   "traefik.#{@hostname}"
+]
 
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     config.vm.define :secretsanta do |secretsanta_config|
         secretsanta_config.vm.box = "Intracto/Debian10"
 
         secretsanta_config.vm.hostname = @hostname
-        secretsanta_config.hostsupdater.aliases = [
-            "mails.#{@hostname}",
-            "phpmyadmin.#{@hostname}",
-            "traefik.#{@hostname}"
-        ]
+        secretsanta_config.hostsupdater.aliases = @aliases
 
         secretsanta_config.vm.provider "virtualbox" do |v|
             # show a display for easy debugging
@@ -43,6 +43,11 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
             v.customize ["setextradata", :id, "VBoxInternal2/SharedFoldersEnableSymlinksCreate/v-root", "1"]
         end
 
+        config.trigger.before :up do |trigger|
+            trigger.info = "Generating SSL certificates..."
+            trigger.run = { path: "vagrant/trigger/generate_certs.sh", args: "#{@hostname} #{@aliases.join(' ')}" }
+        end
+
         # Shared folder over NFS unless Windows
         if OS.windows?
             secretsanta_config.vm.synced_folder ".", "/vagrant"
@@ -53,19 +58,21 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
         secretsanta_config.vm.network "private_network", ip: "192.168.33.50"
 
         # Install custom scripts
-        secretsanta_config.vm.provision :shell, inline: "ln -sf /vagrant/provisioning/scripts/* /usr/local/bin/"
+        secretsanta_config.vm.provision :shell, inline: "ln -sf /vagrant/vagrant/bin/* /usr/local/bin/"
 
         # Docker provisioning
         secretsanta_config.vm.provision "docker" do |d|
 
             d.post_install_provision :shell, inline: "docker network list | grep -q #{@docker_network} || docker network create #{@docker_network}"
 
+            d.build_image "/vagrant/docker/node", args: "-t='node'"
+
             d.run "traefik", image: "traefik:2.2",
             args: %W[
                 -v '/var/run/docker.sock:/var/run/docker.sock:ro'
-                -v '#{@provisioning_dir}/traefik/configuration:/configuration:ro'
-                -v '#{@provisioning_dir}/certs:/etc/ssl/secretsanta:ro'
-                --env-file '#{@provisioning_dir}/traefik/env.list'
+                -v '/vagrant/docker/traefik/configuration:/configuration:ro'
+                -v '/vagrant/docker/traefik/certs:/etc/ssl/secretsanta:ro'
+                --env-file '/vagrant/docker/traefik/env.list'
 
                 --network #{@docker_network}
 
@@ -75,32 +82,42 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
                 --label 'traefik.http.routers.traefik.entrypoints=https'
                 --label 'traefik.http.routers.traefik.tls=true'
 
+                --label "traefik.http.routers.https-redirect.entrypoints=http"
+                --label "traefik.http.routers.https-redirect.rule=HostRegexp(`{any:.*}`)"
+                --label "traefik.http.routers.https-redirect.middlewares=https-redirect"
+                --label "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+
                 -p 80:80
                 -p 443:443
             ].join(' ')
 
-            d.build_image "/vagrant/provisioning/docker/app", args: "-t='app'"
-            d.run "app", args: %W[
-                -v '#{@provisioning_dir}/app/apache/sites:/etc/apache2/sites-enabled:ro'
-                -v '/vagrant:/var/www/html'
-                -v '/dev/shm/app/log:/var/log/identityserver'
-                -v '/dev/shm/app/cache:/var/cache/identityserver'
+            d.run "httpd", image: "httpd:2.4-alpine",
+            args: %W[
+                -v '/vagrant:/usr/local/apache2/htdocs'
+                -v '/vagrant/docker/httpd/httpd.conf:/usr/local/apache2/conf/httpd.conf'
 
                 --network #{@docker_network}
-
-                --label 'traefik.http.routers.app_http.rule=Host(`#{@hostname}`)'
-                --label 'traefik.http.routers.app_http.entrypoints=http'
 
                 --label 'traefik.http.routers.app_https.rule=Host(`#{@hostname}`)'
                 --label 'traefik.http.routers.app_https.entrypoints=https'
                 --label 'traefik.http.routers.app_https.tls=true'
             ].join(' ')
 
+            d.build_image "/vagrant", args: "--target development -t='app'"
+            d.run "app", args: %W[
+                -v '/vagrant/docker/php/conf.d/symfony.dev.ini:/usr/local/etc/php/conf.d/symfony.ini:ro'
+                -v '/vagrant:/var/www/html'
+                --mount source=applogs,target=/var/log/symfony
+                --env-file /vagrant/docker/php/env.list
+
+                --network #{@docker_network}
+            ].join(' ')
+
             d.run "mysql", image: "mysql:5.6",
             args: %W[
                 --network #{@docker_network}
                 -v '/home/vagrant/mysql/data:/var/lib/mysql'
-                --env-file #{@provisioning_dir}/mysql/env.list
+                --env-file /vagrant/docker/mysql/env.list
                 -p 3306:3306
             ].join(' ')
 
@@ -108,10 +125,10 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
             args: %W[
                 --network #{@docker_network}
                 -e PMA_ABSOLUTE_URI=phpmyadmin.#{@hostname}
-                --env-file #{@provisioning_dir}/phpmyadmin/env.list
-                --label 'traefik.http.routers.mailhog.rule=Host(`phpmyadmin.#{@hostname}`)'
-                --label 'traefik.http.routers.mailhog.entrypoints=https'
-                --label 'traefik.http.routers.mailhog.tls=true'
+                --env-file /vagrant/docker/phpmyadmin/env.list
+                --label 'traefik.http.routers.pma.rule=Host(`phpmyadmin.#{@hostname}`)'
+                --label 'traefik.http.routers.pma.entrypoints=https'
+                --label 'traefik.http.routers.pma.tls=true'
             ].join(' ')
 
             d.run "mailhog", image: "mailhog/mailhog:latest",
@@ -124,8 +141,8 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
             ].join(' ')
         end
 
-        # Install the project's dependencies
-        secretsanta_config.vm.provision :shell, inline: "docker exec -i app composer install"
+        # Install the project's dependencies & assets
+        secretsanta_config.vm.provision :shell, path: "vagrant/provision/setup_project.sh"
 
         # After a Vagrant reload, some containers fail to start due to our NFS mount not being fully initialized.
         # We should be able to make the docker systemd service depend on the NFS service/mounts, but I haven't yet

@@ -1,3 +1,0 @@
-[[tls.certificates]]
-  certFile = "/etc/ssl/secretsanta/secretsanta.test.pem"
-  keyFile = "/etc/ssl/secretsanta/secretsanta.test-key.pem"
